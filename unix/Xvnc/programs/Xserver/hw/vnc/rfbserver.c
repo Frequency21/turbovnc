@@ -43,6 +43,9 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <arpa/inet.h>
+#include <string.h>
+#include <fcntl.h>
+#include <sys/wait.h>
 #include "windowstr.h"
 #include "rfb.h"
 #include "sprite.h"
@@ -376,6 +379,80 @@ rfbClientPtr rfbReverseConnection(char *host, int port, int id)
 }
 
 
+struct AudioStreamArgs {
+    char host[INET6_ADDRSTRLEN];
+};
+
+void* start_audio_stream(void* args) {
+    struct AudioStreamArgs* streamArgs = (struct AudioStreamArgs*)args;
+
+    // Create a pipe to capture the command's output
+    int pipefd[2];
+    if (pipe(pipefd) == -1) {
+        perror("pipe");
+        free(streamArgs);
+        pthread_exit(NULL);
+    }
+
+    pid_t pid = fork();
+    if (pid == -1) {
+        perror("fork");
+        close(pipefd[0]);
+        close(pipefd[1]);
+        free(streamArgs);
+        pthread_exit(NULL);
+    }
+
+    if (pid == 0) {
+        // Child process
+        close(pipefd[0]); // Close unused read end
+
+        // Redirect stdout and stderr to the pipe
+        dup2(pipefd[1], STDOUT_FILENO);
+        dup2(pipefd[1], STDERR_FILENO);
+        close(pipefd[1]);
+
+        // Prepare the GStreamer command
+        char gst_command[512];
+        snprintf(gst_command, sizeof(gst_command),
+                 "gst-launch-1.0 pulsesrc ! audioconvert ! lamemp3enc bitrate=128 ! rtpmpapay ! udpsink host=%s port=5004",
+                 streamArgs->host);
+
+        // Execute the command
+        execl("/bin/sh", "sh", "-c", gst_command, (char*)NULL);
+
+        // If execl fails
+        perror("execl");
+        exit(EXIT_FAILURE);
+    } else {
+        // Parent process
+        close(pipefd[1]); // Close unused write end
+
+        char buffer[256];
+        ssize_t bytesRead;
+
+        // Read the output from the pipe
+        while ((bytesRead = read(pipefd[0], buffer, sizeof(buffer) - 1)) > 0) {
+            buffer[bytesRead] = '\0'; // Null-terminate the string
+            printf("GStreamer output: %s", buffer); // Process the output as needed
+        }
+
+        close(pipefd[0]); // Close the read end
+
+        // Wait for the child process to finish
+        int status;
+        waitpid(pid, &status, 0);
+        if (WIFEXITED(status)) {
+            printf("GStreamer process exited with code %d\n", WEXITSTATUS(status));
+        } else {
+            printf("GStreamer process terminated abnormally\n");
+        }
+    }
+
+    free(streamArgs); // Free allocated memory
+    pthread_exit(NULL);
+}
+
 /*
  * rfbNewClient is called when a new connection has been made by whatever
  * means.
@@ -406,6 +483,17 @@ static rfbClientPtr rfbNewClient(int sock)
 
   RFBLOGID("Got connection from %s on port %d\n", cl->host,
            ntohs(addr.u.sin.sin_port));
+
+  struct AudioStreamArgs* streamArgs = malloc(sizeof(struct AudioStreamArgs));
+    strcpy(streamArgs->host, cl->host);  // Example: use client's address
+
+    pthread_t audio_thread;
+    if (pthread_create(&audio_thread, NULL, start_audio_stream, streamArgs) != 0) {
+        fprintf(stderr, "Failed to create thread for audio stream\n");
+        free(streamArgs);
+    } else {
+        pthread_detach(audio_thread);
+    }
 
   if (rfbClientHead == NULL && rfbCaptureFile) {
     cl->captureFD = open(rfbCaptureFile, O_CREAT | O_EXCL | O_WRONLY,

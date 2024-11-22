@@ -99,6 +99,7 @@ static void webSocketsGenSha1Key(char *target, int size, char *key)
 
 /*
  * rfbWebSocketsHandshake is called to handle new WebSockets connections
+ * TODO: spawn gstreamer
  */
 
 Bool webSocketsCheck(rfbClientPtr cl)
